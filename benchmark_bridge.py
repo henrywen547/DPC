@@ -1,145 +1,180 @@
-import os
-import sys
-import json
-import time
-import argparse
-import logging
-from pathlib import Path
+"""Run DPC's native selector once or induce a total order by repeated selection.
 
-# Add DPC root to path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+Only public benchmark rows enter this process. Group sizes and duel scores from
+DPC are diagnostic evidence for each selection, never candidate ranking scores.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import time
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+from benchmark_selection import StageResult, select_candidates
+from dpc.agents.slicer_agent import SlicerAgent
+from dpc.agents.solver_agent import PythonSolverAgent
+from dpc.agents.tester_agent import TesterAgent
+from dpc.core.pipeline import DPCPipeline
+from dpc.llm.openai_llm import OpenAILLM
+
+
 logger = logging.getLogger("DPC-Bridge")
 
-from dpc.llm.openai_llm import OpenAILLM
-from dpc.agents.slicer_agent import SlicerAgent
-from dpc.agents.tester_agent import TesterAgent
-from dpc.agents.solver_agent import PythonSolverAgent
-from dpc.core.pipeline import DPCPipeline
-from dpc.utils.clustering import cluster_sql_candidates
 
-def process_benchmark(args):
-    # Load environment variables
-    load_dotenv()
-    
-    api_key = os.getenv("OPENAI_API_KEY")
-    model_name = os.getenv("LLM_MODEL", "gpt-4o")
-    
-    if not api_key:
-        logger.warning("OPENAI_API_KEY not found in environment. DPC might fail if it uses the LLM API.")
-        
-    llm = OpenAILLM(model_name=model_name, api_key=api_key)
-    pipeline = DPCPipeline(
-        slicer=SlicerAgent(llm),
-        tester=TesterAgent(llm),
-        solver=PythonSolverAgent(llm),
-        grouper=None, # We use execution mode
-        llm=llm
+def _stage_usage(llm: OpenAILLM) -> dict:
+    observed = llm.get_usage()
+    complete = (
+        observed["api_failed_calls"] == 0
+        and observed["usage_reported_calls"] == observed["api_successful_calls"]
     )
-    
-    input_path = Path(args.input)
+    return {
+        "api_calls": observed["api_calls"],
+        "api_successful_calls": observed["api_successful_calls"],
+        "api_failed_calls": observed["api_failed_calls"],
+        "input_tokens": observed["prompt_tokens"] if complete else None,
+        "output_tokens": observed["completion_tokens"] if complete else None,
+        "reported_input_tokens": observed["prompt_tokens"],
+        "reported_output_tokens": observed["completion_tokens"],
+        "token_usage_complete": complete,
+    }
+
+
+def _choose(pipeline: DPCPipeline, llm: OpenAILLM, question: str, db_path: str, candidates) -> StageResult:
+    llm.reset_usage()
+    started = time.monotonic()
+    try:
+        result = pipeline.run(
+            question=question,
+            db_path=db_path,
+            candidate_sqls=[candidate["sql"] for candidate in candidates],
+            sql_timeout=30,
+            python_timeout=30,
+            num_test_data=3,
+            num_solver_attempts=3,
+            phase1_selection_mode="execution",
+            eval_metric="bs_f1",
+        )
+        if not isinstance(result, dict):
+            return StageResult(
+                status="invalid_output",
+                runtime_ms=(time.monotonic() - started) * 1000,
+                usage=_stage_usage(llm),
+                error="DPC returned a non-object result",
+                evidence={"prompt_trace": llm.get_prompt_trace()},
+            )
+        reason = result.get("selection_reason")
+        evidence = {
+            "selection_reason": reason,
+            "champion_score": result.get("champion_score"),
+            "challenger_score": result.get("challenger_score"),
+            "pipeline_fallback": isinstance(reason, str) and (
+                reason.startswith("Slicer Error") or reason.startswith("Verification Error")
+            ),
+            "prompt_trace": llm.get_prompt_trace(),
+        }
+        return StageResult(
+            status="success",
+            runtime_ms=(time.monotonic() - started) * 1000,
+            usage=_stage_usage(llm),
+            selected_sql=result.get("selected_sql"),
+            evidence=evidence,
+        )
+    except Exception as error:
+        status = "timeout" if isinstance(error, TimeoutError) else "runtime_error"
+        logger.exception("DPC selection failed")
+        return StageResult(
+            status=status,
+            runtime_ms=(time.monotonic() - started) * 1000,
+            usage=_stage_usage(llm),
+            error=str(error),
+            evidence={"prompt_trace": llm.get_prompt_trace()},
+        )
+
+
+def process_benchmark(args) -> None:
+    load_dotenv()
+    model_name = os.getenv("LLM_MODEL", "gpt-4o")
+    custom_base_url = os.getenv("OPENAI_BASE_URL")
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        llm = OpenAILLM(model_name=model_name, api_key=api_key)
+        pipeline = DPCPipeline(
+            slicer=SlicerAgent(llm),
+            tester=TesterAgent(llm),
+            solver=PythonSolverAgent(llm),
+            grouper=None,
+            llm=llm,
+        )
+    else:
+        logger.error("OPENAI_API_KEY is missing; every example will be marked runtime_error")
+        llm = None
+        pipeline = None
+
     output_path = Path(args.output)
-    
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(input_path, 'r', encoding='utf-8') as fin, \
-         open(output_path, 'w', encoding='utf-8') as fout:
-        
-        for line in fin:
+    with open(args.input, "r", encoding="utf-8") as source, open(
+        output_path, "w", encoding="utf-8"
+    ) as destination:
+        for line in source:
             if not line.strip():
                 continue
-                
-            data = json.loads(line)
-            question_id = data["question_id"]
-            db_id = data["db_id"]
-            question = data["question"]
-            candidates = data["candidates"] # list of {"candidate_id": "...", "sql": "..."}
-            
+            public = json.loads(line)
+            db_id = public["db_id"]
             db_path = str(Path(args.db_root) / db_id / f"{db_id}.sqlite")
-            
-            sqls = [c["sql"] for c in candidates]
-            
-            start_time = time.time()
-            usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "api_calls": 0}
-            
-            status = "success"
-            error_msg = ""
-            selected_sql = None
-            
-            try:
-                # 1. Run DPC Pipeline
-                # Using defaults: phase1_selection_mode="execution", eval_metric="bs_f1", num_test_data=3, num_solver_attempts=3
-                result = pipeline.run(
-                    question=question,
-                    db_path=db_path,
-                    candidate_sqls=sqls,
-                    sql_timeout=30,
-                    python_timeout=30,
-                    num_test_data=3,
-                    num_solver_attempts=3,
-                    phase1_selection_mode="execution",
-                    eval_metric="bs_f1"
-                )
-                selected_sql = result["selected_sql"]
-                
-                # Aggregate token usage
-                usage = result.get("token_usage", {})
-                usage_totals["prompt_tokens"] += usage.get("prompt_tokens", 0)
-                usage_totals["completion_tokens"] += usage.get("completion_tokens", 0)
-                usage_totals["api_calls"] += 1 # We just count 1 pipeline run as 1 logic unit, but actual LLM calls might be more. We'll just pass tokens.
-                
-            except Exception as e:
-                logger.error(f"Error processing {question_id}: {e}")
-                status = "runtime_error"
-                error_msg = str(e)
-                
-            end_time = time.time()
-            runtime_ms = (end_time - start_time) * 1000
-            
+            started = time.monotonic()
+
+            def choose(remaining):
+                if pipeline is None or llm is None:
+                    return StageResult(
+                        status="runtime_error",
+                        runtime_ms=0.0,
+                        usage={
+                            "api_calls": 0,
+                            "api_successful_calls": 0,
+                            "api_failed_calls": 0,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "reported_input_tokens": 0,
+                            "reported_output_tokens": 0,
+                            "token_usage_complete": True,
+                        },
+                        error="OPENAI_API_KEY is missing",
+                        selector_invoked=False,
+                    )
+                return _choose(pipeline, llm, public["question"], db_path, remaining)
+
+            selection = select_candidates(public["candidates"], choose, args.mode)
             output = {
                 "schema_version": 1,
-                "benchmark_id": data["benchmark_id"],
-                "question_id": question_id,
+                "benchmark_id": public["benchmark_id"],
+                "question_id": public["question_id"],
                 "method_id": args.method_id,
-                "method_type": "selector",
-                "status": status,
-                "runtime_ms": runtime_ms,
+                "method_type": "selector" if args.mode == "one_shot" else "ranker",
+                "method_mode": "native_selector" if args.mode == "one_shot" else "sequential_ranking",
+                "status": selection.pop("status"),
+                "model_id": model_name,
+                "api_backend": "openai_compatible" if custom_base_url else "openai_default",
+                "api_base_url_sha256": hashlib.sha256(custom_base_url.encode("utf-8")).hexdigest()
+                if custom_base_url else None,
+                "runtime_ms": (time.monotonic() - started) * 1000,
+                **selection,
             }
-            
-            if status == "success":
-                # Map selected_sql back to candidate_id
-                selected_cid = None
-                for c in candidates:
-                    if c["sql"] == selected_sql:
-                        selected_cid = c["candidate_id"]
-                        break
-                
-                # Fallback if strict string matching fails (e.g., whitespace formatting changes)
-                if not selected_cid:
-                    selected_cid = candidates[0]["candidate_id"]
-                    
-                output["selected_candidate_id"] = selected_cid
-                output["usage"] = {
-                    "api_calls": usage_totals["api_calls"],
-                    "input_tokens": usage_totals["prompt_tokens"],
-                    "output_tokens": usage_totals["completion_tokens"],
-                    "estimated_cost_usd": 0.0 # DPC doesn't calculate cost internally
-                }
-            else:
-                output["error"] = {"message": error_msg}
-                
-            fout.write(json.dumps(output) + "\n")
+            destination.write(json.dumps(output, ensure_ascii=False) + "\n")
+            destination.flush()
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    logging.basicConfig(level=logging.INFO)
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--method-id", required=True)
     parser.add_argument("--db-root", required=True)
-    args = parser.parse_args()
-    
-    process_benchmark(args)
+    parser.add_argument("--mode", choices=("one_shot", "sequential"), default="one_shot")
+    process_benchmark(parser.parse_args())

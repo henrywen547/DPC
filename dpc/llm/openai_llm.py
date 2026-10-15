@@ -41,6 +41,8 @@ class OpenAILLM(BaseLLM):
             logger.debug(f"  [{msg['role'].upper()}]: {msg['content']}")
 
         for attempt in range(self.max_retries):
+            request_recorded = False
+            prompt_index = self._record_prompt(messages, attempt + 1)
             try:
                 response = self.client.chat.completions.create(
                     model=self.model_name,
@@ -48,6 +50,9 @@ class OpenAILLM(BaseLLM):
                     temperature=self.temperature,
                     max_tokens=self.max_tokens
                 )
+                self._record_api_call(successful=True)
+                request_recorded = True
+                self._finish_prompt(prompt_index, "api_response")
                 
                 # Track token usage
                 if response.usage:
@@ -60,6 +65,13 @@ class OpenAILLM(BaseLLM):
                 logger.debug(f"LLM Response (Attempt {attempt + 1}): {content}")
                 return content
             except Exception as e:
+                # A response may be received but fail content parsing. Count
+                # each request exactly once, including retried attempts.
+                if not request_recorded:
+                    self._record_api_call(successful=False)
+                    self._finish_prompt(prompt_index, "api_error")
+                else:
+                    self._finish_prompt(prompt_index, "response_parse_error")
                 last_exception = e
                 logger.error(f"Error calling LLM (attempt {attempt + 1}/{self.max_retries}): {e}")
                 if attempt < self.max_retries - 1:

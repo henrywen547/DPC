@@ -388,6 +388,42 @@ DPC-SQL/
   - `bash scripts/...`
 - Prompt-based paths depend on an available OpenAI-compatible LLM backend and may incur API cost.
 
+### Frozen benchmark bridge
+
+`benchmark_bridge.py` accepts public candidate JSONL from the adjacent
+`sql_correction_agent` benchmark. It loads `.env` in this repository; copy
+`.env.example` to `.env` and fill in `OPENAI_API_KEY` and `LLM_MODEL` locally.
+`OPENAI_BASE_URL` is optional for an OpenAI-compatible service. The `.env` file
+is ignored by Git. Install the locked environment with `uv sync --frozen`.
+
+The default `--mode one_shot` emits DPC's native selected candidate ID.
+`--mode sequential` repeatedly runs the same selector on the remaining public
+candidates, then appends the last ID. This induced order is **DPC Sequential
+Ranking**, not a native score or original one-shot DPC output. Each attempt
+records its remaining IDs, selection reason, status, runtime, and API usage.
+Group and duel scores are diagnostic only and are never promoted to
+candidate-level ranking scores. A selection that cannot be mapped to a
+remaining candidate is an `invalid_output`; partial rankings remain in the
+trace on failure. Each stage also stores the exact request prompts and request
+outcomes. Temperature is zero, but no API seed is set.
+
+For example, from this directory:
+
+```bash
+.venv/bin/python benchmark_bridge.py \
+  --input ../sql_correction_agent/benchmarks/natural_v1/gpt41mini/k3_seed42.jsonl \
+  --output /tmp/dpc_sequential_predictions.jsonl \
+  --method-id dpc_sequential \
+  --mode sequential \
+  --db-root ../sql_correction_agent/data/spider/database
+```
+
+Central metrics and the one-shot versus sequential cost comparison are
+generated in `sql_correction_agent`; see its
+`README_EVALUATION_BENCHMARK.md`. The bridge records actual API request
+attempts including retries, and reports token totals only when usage is
+complete. It does not invent a dollar estimate.
+
 ---
 
 ## 📚 Citation

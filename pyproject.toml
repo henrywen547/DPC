@@ -9,6 +9,7 @@ dependencies = [
     "numpy",
     "openai",
     "pandas",
+    "python-dotenv",
     "scipy",
     "tabulate",
     "tqdm",
